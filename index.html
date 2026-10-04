@@ -328,7 +328,8 @@
           clearInterval(timer);
           progressBar.style.width = '100%';
           statusDiv.textContent = (r && r.message) || '（後端沒有回覆內容）';
-          statusDiv.style.color = (r && r.ok === false) ? '#D92D20' : '#D31145';
+          var lv = (r && r.level) || ((r && r.ok === false) ? 'error' : 'ok');
+          statusDiv.style.color = lv === 'error' ? '#D92D20' : (lv === 'warn' ? '#B54708' : '#067647');
           setBusy(false);
           if (r && r.ok) {
             fileInput.value = '';
