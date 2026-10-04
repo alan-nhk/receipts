@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>收據上載系統</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'PingFang HK',
+        'Microsoft JhengHei', sans-serif;
+      background-color: #F7F7FA;
+      color: #374151;
+      display: flex;
+      justify-content: center;
+      padding: 20px;
+      margin: 0;
+      min-height: 100vh;
+    }
+
+    .container {
+      background-color: #FFFFFF;
+      padding: 30px;
+      border-radius: 8px;
+      box-shadow: 0px 4px 16px rgba(17, 12, 46, 0.06);
+      width: 100%;
+      max-width: 400px;
+      align-self: flex-start;
+    }
+
+    h2 {
+      color: #1F2330;
+      font-size: 20px;
+      margin: 0 0 6px;
+    }
+
+    .sub {
+      font-size: 13px;
+      color: #9CA3AF;
+      margin-bottom: 20px;
+    }
+
+    label {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
+
+    /* 拖放區 */
+    .drop {
+      border: 1.5px dashed #D1D5DB;
+      border-radius: 6px;
+      padding: 22px 14px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .15s, background-color .15s;
+      background-color: #FCFCFD;
+      margin-bottom: 10px;
+    }
+
+    .drop:hover, .drop.over { border-color: #D31145; background-color: #FFF7F9; }
+
+    .drop .big { font-size: 14px; font-weight: 600; color: #374151; }
+    .drop .hint { font-size: 12px; color: #9CA3AF; margin-top: 6px; }
+    .drop.has-file { border-style: solid; border-color: #D31145; background-color: #FFF7F9; }
+    .drop .fname { font-size: 13px; font-weight: 600; color: #D31145; word-break: break-all; }
+    .drop .fsize { font-size: 12px; color: #9CA3AF; margin-top: 4px; }
+
+    input[type="file"] { display: none; }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 12px;
+      margin-bottom: 20px;
+      border: 1px solid #E5E7EB;
+      border-radius: 6px;
+      font-size: 14px;
+      font-family: inherit;
+    }
+
+    input[type="text"]:focus { border-color: #D31145; outline: none; }
+
+    button {
+      background-color: #D31145;
+      color: white;
+      padding: 14px;
+      border: none;
+      border-radius: 6px;
+      width: 100%;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    button:disabled { background-color: #E67393; cursor: not-allowed; }
+
+    .progress-container {
+      width: 100%;
+      background-color: #E5E7EB;
+      border-radius: 6px;
+      margin-top: 15px;
+      display: none;
+      overflow: hidden;
+    }
+
+    .progress-bar {
+      height: 8px;
+      background-color: #D31145;
+      width: 0%;
+      transition: width .5s ease;
+    }
+
+    #status {
+      margin-top: 15px;
+      font-size: 14px;
+      text-align: center;
+      font-weight: 600;
+      line-height: 1.5;
+      white-space: pre-line;
+    }
+
+    .conn {
+      margin-top: 18px;
+      padding-top: 12px;
+      border-top: 1px solid #F3F4F6;
+      font-size: 12px;
+      color: #9CA3AF;
+      text-align: center;
+    }
+
+    .conn b { font-weight: 600; }
+    .ok { color: #067647; }
+    .bad { color: #D92D20; }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <h2>上載收據</h2>
+    <div class="sub">AI 會自動辨識收據內容並寫入試算表</div>
+
+    <label for="file">選擇收據（圖片或 PDF）</label>
+    <div class="drop" id="drop">
+      <div id="dropInner">
+        <div class="big">按此選擇檔案</div>
+        <div class="hint">或將檔案拖放到這裡</div>
+      </div>
+    </div>
+    <input type="file" id="file" accept="image/*,application/pdf">
+
+    <label for="remarks">備註（客戶名稱）</label>
+    <input type="text" id="remarks" placeholder="請輸入客戶名稱">
+
+    <button id="submitBtn">送出上傳</button>
+
+    <div class="progress-container" id="progressContainer">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+
+    <div id="status"></div>
+
+    <div class="conn" id="conn">檢查後端連線中…</div>
+  </div>
+
+  <script>
+    // Apps Script 後端（Gemini API key 一直留在後端，不會出現在此頁）
+    var API_URL = 'https://script.google.com/macros/s/AKfycbzyQsfWGbQffFy16vi3oxOQj79SSerZKBO1o7j-8ubcRaKdMiyk4Fh2D0IQpkZShytB/exec';
+    var MAX_BYTES = 15 * 1024 * 1024;
+
+    var drop = document.getElementById('drop');
+    var fileInput = document.getElementById('file');
+    var remarksInput = document.getElementById('remarks');
+    var statusDiv = document.getElementById('status');
+    var submitBtn = document.getElementById('submitBtn');
+    var progressContainer = document.getElementById('progressContainer');
+    var progressBar = document.getElementById('progressBar');
+    var connDiv = document.getElementById('conn');
+
+    var busy = false;
+
+    // ---- 呼叫後端 ----------------------------------------------------------
+    // Content-Type 用 text/plain 是刻意的：Apps Script 不會回應 CORS preflight
+    // (OPTIONS)，用 application/json 會直接被瀏覽器擋住。
+    function callApi(payload) {
+      return fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload)
+      }).then(function (res) {
+        return res.text();
+      }).then(function (txt) {
+        try {
+          return JSON.parse(txt);
+        } catch (e) {
+          return { ok: false, message: '伺服器回應格式異常：' + txt.slice(0, 180) };
+        }
+      });
+    }
+
+    // 開頁時 ping 一次，確認後端通
+    callApi({ action: 'ping' }).then(function (r) {
+      if (r && r.ok) {
+        connDiv.innerHTML = '<b class="ok">✅ 後端連線正常</b>';
+      } else {
+        connDiv.innerHTML = '<b class="bad">⚠️ 後端連線異常</b> ' + ((r && r.message) || '');
+      }
+    }).catch(function () {
+      connDiv.innerHTML = '<b class="bad">⚠️ 無法連接後端</b>（請檢查網絡）';
+    });
+
+    // ---- 檔案選擇 ----------------------------------------------------------
+    function humanSize(n) {
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+      return (n / 1024 / 1024).toFixed(2) + ' MB';
+    }
+
+    function guessMime(file) {
+      if (file.type) return file.type;
+      var n = (file.name || '').toLowerCase();
+      if (n.endsWith('.pdf')) return 'application/pdf';
+      if (n.endsWith('.png')) return 'image/png';
+      if (n.endsWith('.jpg') || n.endsWith('.jpeg')) return 'image/jpeg';
+      if (n.endsWith('.heic')) return 'image/heic';
+      if (n.endsWith('.webp')) return 'image/webp';
+      return 'application/octet-stream';
+    }
+
+    function renderFile() {
+      var f = fileInput.files[0];
+      if (!f) {
+        drop.className = 'drop';
+        document.getElementById('dropInner').innerHTML =
+          '<div class="big">按此選擇檔案</div><div class="hint">或將檔案拖放到這裡</div>';
+        return;
+      }
+      drop.className = 'drop has-file';
+      document.getElementById('dropInner').innerHTML =
+        '<div class="fname">' + f.name.replace(/[<>&]/g, '') + '</div>' +
+        '<div class="fsize">' + humanSize(f.size) + '　（按此可重新選擇）</div>';
+    }
+
+    drop.addEventListener('click', function () { fileInput.click(); });
+    fileInput.addEventListener('change', renderFile);
+
+    ['dragenter', 'dragover'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add('over'); });
+    });
+    ['dragleave', 'drop'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.remove('over'); });
+    });
+    drop.addEventListener('drop', function (e) {
+      var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!f) return;
+      var dt = new DataTransfer();
+      dt.items.add(f);
+      fileInput.files = dt.files;
+      renderFile();
+    });
+
+    // ---- 上載 --------------------------------------------------------------
+    function setBusy(v) {
+      busy = v;
+      submitBtn.disabled = v;
+      submitBtn.textContent = v ? '上傳並讓 AI 處理中…' : '送出上傳';
+    }
+
+    function resetProgress() {
+      progressContainer.style.display = 'none';
+      progressBar.style.width = '0%';
+    }
+
+    function upload() {
+      if (busy) return;
+
+      var file = fileInput.files[0];
+      if (!file) {
+        statusDiv.textContent = '⚠️ 請先選擇一個檔案！';
+        statusDiv.style.color = '#D92D20';
+        return;
+      }
+      if (file.size > MAX_BYTES) {
+        statusDiv.textContent = '⚠️ 檔案太大（' + humanSize(file.size) + '），上限約 15MB。\n' +
+          '建議先壓縮圖片或只上載需要的頁面。';
+        statusDiv.style.color = '#D92D20';
+        return;
+      }
+
+      var remarks = remarksInput.value;
+      setBusy(true);
+      statusDiv.textContent = '正在讀取檔案…';
+      statusDiv.style.color = '#9CA3AF';
+      progressContainer.style.display = 'block';
+      progressBar.style.width = '8%';
+
+      var w = 8;
+      var timer = setInterval(function () {
+        if (w < 88) {
+          w += (88 - w) * 0.08;
+          progressBar.style.width = w + '%';
+        }
+      }, 500);
+
+      var reader = new FileReader();
+
+      reader.onerror = function () {
+        clearInterval(timer);
+        resetProgress();
+        setBusy(false);
+        statusDiv.textContent = '❌ 讀取檔案失敗，請重試。';
+        statusDiv.style.color = '#D92D20';
+      };
+
+      reader.onload = function (e) {
+        var base64 = e.target.result.split(',')[1];
+        statusDiv.textContent = 'AI 辨識中，請稍候（約 5–20 秒）…';
+
+        callApi({
+          fileName: file.name,
+          mimeType: guessMime(file),
+          fileBase64: base64,
+          remarks: remarks
+        }).then(function (r) {
+          clearInterval(timer);
+          progressBar.style.width = '100%';
+          statusDiv.textContent = (r && r.message) || '（後端沒有回覆內容）';
+          statusDiv.style.color = (r && r.ok === false) ? '#D92D20' : '#D31145';
+          setBusy(false);
+          if (r && r.ok) {
+            fileInput.value = '';
+            renderFile();
+            remarksInput.value = '';
+            setTimeout(function () { resetProgress(); }, 2500);
+          }
+        }).catch(function (err) {
+          clearInterval(timer);
+          resetProgress();
+          setBusy(false);
+          statusDiv.textContent = '❌ 連線失敗：' + err.message + '\n（請確認網絡後再試一次）';
+          statusDiv.style.color = '#D92D20';
+        });
+      };
+
+      reader.readAsDataURL(file);
+    }
+
+    submitBtn.addEventListener('click', upload);
+
+    window.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && document.activeElement === remarksInput) upload();
+    });
+  </script>
+</body>
+
+</html>
