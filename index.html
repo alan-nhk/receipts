@@ -176,18 +176,30 @@
     // ---- 呼叫後端 ----------------------------------------------------------
     // Content-Type 用 text/plain 是刻意的：Apps Script 不會回應 CORS preflight
     // (OPTIONS)，用 application/json 會直接被瀏覽器擋住。
+    //
+    // ⚠️ 重要：Apps Script 對「處理時間較長」的請求，有時唔會送返我哋嘅 JSON，
+    // 而係送返一個 Google 錯誤頁（HTML）或者 HTTP 4xx/5xx。呢個時候資料其實
+    // 已經寫入 —— 所以一定要「拋錯」，交由呼叫者用 jobId 補查真正結果，
+    // 唔可以當成一般錯誤直接顯示（會誤導使用者以為上載失敗）。
     function callApi(payload) {
       return fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify(payload)
       }).then(function (res) {
-        return res.text();
-      }).then(function (txt) {
+        return res.text().then(function (txt) { return { status: res.status, txt: txt }; });
+      }).then(function (o) {
+        if (o.status >= 400) {
+          var e1 = new Error('HTTP ' + o.status);
+          e1.lost = true;
+          throw e1;
+        }
         try {
-          return JSON.parse(txt);
+          return JSON.parse(o.txt);
         } catch (e) {
-          return { ok: false, level: 'error', message: '伺服器回應格式異常：' + txt.slice(0, 180) };
+          var e2 = new Error('非 JSON 回應');
+          e2.lost = true;              // 標記為「回應遺失」，唔係業務錯誤
+          throw e2;
         }
       });
     }
