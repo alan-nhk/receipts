@@ -30,26 +30,11 @@
       align-self: flex-start;
     }
 
-    h2 {
-      color: #1F2330;
-      font-size: 20px;
-      margin: 0 0 6px;
-    }
+    h2 { color: #1F2330; font-size: 20px; margin: 0 0 6px; }
+    .sub { font-size: 13px; color: #9CA3AF; margin-bottom: 20px; }
 
-    .sub {
-      font-size: 13px;
-      color: #9CA3AF;
-      margin-bottom: 20px;
-    }
+    label { display: block; font-size: 14px; margin-bottom: 8px; font-weight: 600; }
 
-    label {
-      display: block;
-      font-size: 14px;
-      margin-bottom: 8px;
-      font-weight: 600;
-    }
-
-    /* 拖放區 */
     .drop {
       border: 1.5px dashed #D1D5DB;
       border-radius: 6px;
@@ -62,7 +47,6 @@
     }
 
     .drop:hover, .drop.over { border-color: #D31145; background-color: #FFF7F9; }
-
     .drop .big { font-size: 14px; font-weight: 600; color: #374151; }
     .drop .hint { font-size: 12px; color: #9CA3AF; margin-top: 6px; }
     .drop.has-file { border-style: solid; border-color: #D31145; background-color: #FFF7F9; }
@@ -132,8 +116,8 @@
       text-align: center;
     }
 
-    .conn b { font-weight: 600; }
     .ok { color: #067647; }
+    .warn { color: #B54708; }
     .bad { color: #D92D20; }
   </style>
 </head>
@@ -147,7 +131,7 @@
     <div class="drop" id="drop">
       <div id="dropInner">
         <div class="big">按此選擇檔案</div>
-        <div class="hint">或將檔案拖放到這裡</div>
+        <div class="hint">或將檔案拖放到這裡（相片會自動壓縮）</div>
       </div>
     </div>
     <input type="file" id="file" accept="image/*,application/pdf">
@@ -169,7 +153,13 @@
   <script>
     // Apps Script 後端（Gemini API key 一直留在後端，不會出現在此頁）
     var API_URL = 'https://script.google.com/macros/s/AKfycbzyQsfWGbQffFy16vi3oxOQj79SSerZKBO1o7j-8ubcRaKdMiyk4Fh2D0IQpkZShytB/exec';
-    var MAX_BYTES = 15 * 1024 * 1024;
+
+    // 相片會先壓縮，所以來源上限可以放寬
+    var MAX_SOURCE_BYTES = 25 * 1024 * 1024;
+    var MAX_DIMENSION = 1600;     // 長邊最大像素
+    var JPEG_QUALITY = 0.85;
+    var POLL_TRIES = 20;          // 回應遺失時的補查次數
+    var POLL_INTERVAL_MS = 3000;
 
     var drop = document.getElementById('drop');
     var fileInput = document.getElementById('file');
@@ -181,6 +171,7 @@
     var connDiv = document.getElementById('conn');
 
     var busy = false;
+    var creepTimer = null;
 
     // ---- 呼叫後端 ----------------------------------------------------------
     // Content-Type 用 text/plain 是刻意的：Apps Script 不會回應 CORS preflight
@@ -196,7 +187,7 @@
         try {
           return JSON.parse(txt);
         } catch (e) {
-          return { ok: false, message: '伺服器回應格式異常：' + txt.slice(0, 180) };
+          return { ok: false, level: 'error', message: '伺服器回應格式異常：' + txt.slice(0, 180) };
         }
       });
     }
@@ -222,30 +213,31 @@
     function guessMime(file) {
       if (file.type) return file.type;
       var n = (file.name || '').toLowerCase();
-      if (n.endsWith('.pdf')) return 'application/pdf';
-      if (n.endsWith('.png')) return 'image/png';
-      if (n.endsWith('.jpg') || n.endsWith('.jpeg')) return 'image/jpeg';
-      if (n.endsWith('.heic')) return 'image/heic';
-      if (n.endsWith('.webp')) return 'image/webp';
+      if (n.slice(-4) === '.pdf') return 'application/pdf';
+      if (n.slice(-4) === '.png') return 'image/png';
+      if (n.slice(-5) === '.jpeg' || n.slice(-4) === '.jpg') return 'image/jpeg';
+      if (n.slice(-5) === '.heic') return 'image/heic';
+      if (n.slice(-5) === '.webp') return 'image/webp';
       return 'application/octet-stream';
     }
 
-    function renderFile() {
+    function renderFile(extra) {
       var f = fileInput.files[0];
       if (!f) {
         drop.className = 'drop';
         document.getElementById('dropInner').innerHTML =
-          '<div class="big">按此選擇檔案</div><div class="hint">或將檔案拖放到這裡</div>';
+          '<div class="big">按此選擇檔案</div><div class="hint">或將檔案拖放到這裡（相片會自動壓縮）</div>';
         return;
       }
       drop.className = 'drop has-file';
       document.getElementById('dropInner').innerHTML =
         '<div class="fname">' + f.name.replace(/[<>&]/g, '') + '</div>' +
-        '<div class="fsize">' + humanSize(f.size) + '　（按此可重新選擇）</div>';
+        '<div class="fsize">' + humanSize(f.size) + (extra ? '　→ ' + extra : '') +
+        '　（按此可重新選擇）</div>';
     }
 
     drop.addEventListener('click', function () { fileInput.click(); });
-    fileInput.addEventListener('change', renderFile);
+    fileInput.addEventListener('change', function () { renderFile(); });
 
     ['dragenter', 'dragover'].forEach(function (ev) {
       drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add('over'); });
@@ -262,91 +254,177 @@
       renderFile();
     });
 
-    // ---- 上載 --------------------------------------------------------------
+    // ---- 壓縮：把長邊縮到 1600px 並轉 JPEG ---------------------------------
+    // 大幅縮短上載時間同 Gemini 處理時間。後端處理時間太長時，
+    // Apps Script 有時會送唔返個回應（資料其實已經寫入），所以壓縮是主要修正。
+    function compressImage(file) {
+      var isImage = /^image\//.test(file.type) ||
+        /\.(jpe?g|png|heic|heif|webp|bmp)$/i.test(file.name || '');
+      if (!isImage) return Promise.resolve(null);
+      if (typeof createImageBitmap !== 'function') return Promise.resolve(null);
+
+      return createImageBitmap(file).then(function (bmp) {
+        var w = bmp.width, h = bmp.height;
+        var scale = Math.min(1, MAX_DIMENSION / Math.max(w, h));
+        var nw = Math.max(1, Math.round(w * scale));
+        var nh = Math.max(1, Math.round(h * scale));
+
+        // 已經又細又輕就唔壓
+        if (scale === 1 && file.size <= 700 * 1024) {
+          if (bmp.close) bmp.close();
+          return null;
+        }
+
+        var c = document.createElement('canvas');
+        c.width = nw;
+        c.height = nh;
+        var ctx = c.getContext('2d');
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, nw, nh);
+        ctx.drawImage(bmp, 0, 0, nw, nh);
+        if (bmp.close) bmp.close();
+
+        return new Promise(function (resolve) {
+          c.toBlob(function (blob) {
+            resolve(blob && blob.size < file.size ? blob : null);
+          }, 'image/jpeg', JPEG_QUALITY);
+        });
+      }).catch(function () { return null; });
+    }
+
+    function fileToBase64(file) {
+      return new Promise(function (resolve, reject) {
+        var reader = new FileReader();
+        reader.onerror = function () { reject(new Error('讀取檔案失敗')); };
+        reader.onload = function (e) { resolve(e.target.result.split(',')[1]); };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // ---- 進度條 / 狀態 -----------------------------------------------------
+    function setStatus(text, cls) {
+      statusDiv.textContent = text;
+      statusDiv.style.color =
+        cls === 'error' ? '#D92D20' :
+        cls === 'warn' ? '#B54708' :
+        cls === 'ok' ? '#067647' : '#9CA3AF';
+    }
+
     function setBusy(v) {
       busy = v;
       submitBtn.disabled = v;
       submitBtn.textContent = v ? '上傳並讓 AI 處理中…' : '送出上傳';
     }
 
-    function resetProgress() {
-      progressContainer.style.display = 'none';
-      progressBar.style.width = '0%';
+    function startProgress() {
+      progressContainer.style.display = 'block';
+      progressBar.style.width = '8%';
+      var w = 8;
+      clearInterval(creepTimer);
+      creepTimer = setInterval(function () {
+        if (w < 90) { w += (90 - w) * 0.06; progressBar.style.width = w + '%'; }
+      }, 500);
     }
 
+    function stopProgress(reset) {
+      clearInterval(creepTimer);
+      creepTimer = null;
+      if (reset) { progressContainer.style.display = 'none'; progressBar.style.width = '0%'; }
+    }
+
+    function done(r) {
+      progressBar.style.width = '100%';
+      setStatus((r && r.message) || '（後端沒有回覆內容）',
+        (r && r.level) || ((r && r.ok === false) ? 'error' : 'ok'));
+      setBusy(false);
+      if (r && r.ok) {
+        fileInput.value = '';
+        renderFile();
+        remarksInput.value = '';
+        setTimeout(function () { stopProgress(true); }, 2500);
+      } else {
+        stopProgress(false);
+      }
+    }
+
+    // ---- 回應遺失時，用 jobId 追回真正結果 ---------------------------------
+    // 大圖會令後端處理時間變長，Apps Script 有時送唔返回應 —— 但資料其實已經寫入。
+    // 有 jobId 就可以補查，唔會再誤報「連線失敗」。
+    function pollResult(jobId) {
+      return new Promise(function (resolve) {
+        if (!jobId) {
+          resolve({ ok: true, level: 'warn', message: '已送出。\n（未能取得回覆，請稍後到試算表確認）' });
+          return;
+        }
+        var tries = 0;
+        var timer = setInterval(function () {
+          tries++;
+          callApi({ action: 'result', jobId: jobId }).then(function (r) {
+            if (r && r.level !== 'pending') {
+              clearInterval(timer);
+              resolve(r);
+            } else if (tries >= POLL_TRIES) {
+              clearInterval(timer);
+              resolve({ ok: true, level: 'warn', message: '已送出。\nAI 仍在處理，請稍後到試算表確認。' });
+            }
+          }).catch(function () {
+            if (tries >= POLL_TRIES) {
+              clearInterval(timer);
+              resolve({ ok: true, level: 'warn', message: '已送出。\n（網絡不穩，請稍後到試算表確認）' });
+            }
+          });
+        }, POLL_INTERVAL_MS);
+      });
+    }
+
+    // ---- 主流程 ------------------------------------------------------------
     function upload() {
       if (busy) return;
 
       var file = fileInput.files[0];
-      if (!file) {
-        statusDiv.textContent = '⚠️ 請先選擇一個檔案！';
-        statusDiv.style.color = '#D92D20';
-        return;
-      }
-      if (file.size > MAX_BYTES) {
-        statusDiv.textContent = '⚠️ 檔案太大（' + humanSize(file.size) + '），上限約 15MB。\n' +
-          '建議先壓縮圖片或只上載需要的頁面。';
-        statusDiv.style.color = '#D92D20';
+      if (!file) { setStatus('⚠️ 請先選擇一個檔案！', 'error'); return; }
+      if (file.size > MAX_SOURCE_BYTES) {
+        setStatus('⚠️ 檔案太大（' + humanSize(file.size) + '），上限 25MB。', 'error');
         return;
       }
 
       var remarks = remarksInput.value;
+      var jobId = 'j' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
       setBusy(true);
-      statusDiv.textContent = '正在讀取檔案…';
-      statusDiv.style.color = '#9CA3AF';
-      progressContainer.style.display = 'block';
-      progressBar.style.width = '8%';
+      setStatus('正在準備檔案…');
+      startProgress();
 
-      var w = 8;
-      var timer = setInterval(function () {
-        if (w < 88) {
-          w += (88 - w) * 0.08;
-          progressBar.style.width = w + '%';
+      compressImage(file).then(function (blob) {
+        if (blob) {
+          renderFile(humanSize(blob.size) + ' 已壓縮');
+          return {
+            file: blob,
+            mimeType: 'image/jpeg',
+            name: (file.name || 'image').replace(/\.[^.]+$/, '') + '.jpg'
+          };
         }
-      }, 500);
-
-      var reader = new FileReader();
-
-      reader.onerror = function () {
-        clearInterval(timer);
-        resetProgress();
-        setBusy(false);
-        statusDiv.textContent = '❌ 讀取檔案失敗，請重試。';
-        statusDiv.style.color = '#D92D20';
-      };
-
-      reader.onload = function (e) {
-        var base64 = e.target.result.split(',')[1];
-        statusDiv.textContent = 'AI 辨識中，請稍候（約 5–20 秒）…';
-
-        callApi({
-          fileName: file.name,
-          mimeType: guessMime(file),
-          fileBase64: base64,
-          remarks: remarks
-        }).then(function (r) {
-          clearInterval(timer);
-          progressBar.style.width = '100%';
-          statusDiv.textContent = (r && r.message) || '（後端沒有回覆內容）';
-          var lv = (r && r.level) || ((r && r.ok === false) ? 'error' : 'ok');
-          statusDiv.style.color = lv === 'error' ? '#D92D20' : (lv === 'warn' ? '#B54708' : '#067647');
-          setBusy(false);
-          if (r && r.ok) {
-            fileInput.value = '';
-            renderFile();
-            remarksInput.value = '';
-            setTimeout(function () { resetProgress(); }, 2500);
-          }
-        }).catch(function (err) {
-          clearInterval(timer);
-          resetProgress();
-          setBusy(false);
-          statusDiv.textContent = '❌ 連線失敗：' + err.message + '\n（請確認網絡後再試一次）';
-          statusDiv.style.color = '#D92D20';
+        return { file: file, mimeType: guessMime(file), name: file.name };
+      }).then(function (prep) {
+        setStatus('AI 辨識中，請稍候（約 5–20 秒）…');
+        progressBar.style.width = '35%';
+        return fileToBase64(prep.file).then(function (base64) {
+          return callApi({
+            fileName: prep.name,
+            mimeType: prep.mimeType,
+            fileBase64: base64,
+            remarks: remarks,
+            jobId: jobId
+          });
         });
-      };
-
-      reader.readAsDataURL(file);
+      }).then(function (r) {
+        done(r);
+      }).catch(function () {
+        // 唔一定係失敗 —— 可能只係回應遺失。追查真正結果。
+        setStatus('網絡回應中斷，正在確認處理結果…', 'warn');
+        progressBar.style.width = '95%';
+        return pollResult(jobId).then(done);
+      });
     }
 
     submitBtn.addEventListener('click', upload);
